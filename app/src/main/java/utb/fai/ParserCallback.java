@@ -1,108 +1,134 @@
 package utb.fai;
 
-import java.net.URI;
-import java.util.HashSet;
-import java.util.LinkedList;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
 
-import javax.swing.text.MutableAttributeSet;
-import javax.swing.text.html.HTML;
-import javax.swing.text.html.HTMLEditorKit;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Třída ParserCallback je používána parserem DocumentParser,
- * je implementován přímo v JDK a umí parsovat HTML do verze 3.0.
- * Při parsování (analýze) HTML stránky volá tento parser
- * jednotlivé metody třídy ParserCallback, co nám umožuje
- * provádět s částmi HTML stránky naše vlastní akce.
- * 
- * @author Tomá Dulík
+ * Extracts visible text, word frequencies and hyperlinks from a JSoup document.
+ * One instance is created for each page, so its collections do not need
+ * additional synchronization.
  */
-class ParserCallback extends HTMLEditorKit.ParserCallback {
+final class ParserCallback {
+    private static final Pattern WORD_PATTERN = Pattern.compile(
+            "[\\p{L}]+(?:['’][\\p{L}]+)?");
+    private static final Pattern HIDDEN_STYLE_PATTERN = Pattern.compile(
+            "(?i)(?:^|;)\\s*(?:display\\s*:\\s*none|visibility\\s*:\\s*hidden)\\b");
 
-    /**
-     * pageURI bude obsahovat URI aktuální parsované stránky. Budeme
-     * jej vyuívat pro resolving všech URL, které v kódu stránky najdeme
-     * - předtím, než nalezené URL uložíme do foundURLs, musíme z něj udělat
-     * absolutní URL!
-     */
-    URI pageURI;
+    private static final String NON_TEXT_ELEMENTS = String.join(",",
+            "script", "style", "noscript", "template", "head", "title",
+            "svg", "canvas", "iframe", "object", "embed", "[hidden]",
+            "[aria-hidden=true]", "input[type=hidden]");
 
-    /**
-     * depth bude obsahovat aktuální hloubku zanoření
-     */
-    int depth = 0, maxDepth = 5;
+    private final URI pageURI;
+    private final boolean collectLinks;
+    private final Map<String, Long> wordFrequencies = new HashMap<>();
+    private final Set<URI> links = new LinkedHashSet<>();
 
-    /**
-     * visitedURLs je množina všech URL, které jsme již navtívili
-     * (parsovali). Pokud najdeme na stránce URL, který je v této množině,
-     * nebudeme jej u dále parsovat
-     */
-    HashSet<URI> visitedURIs;
-
-    /**
-     * foundURLs jsou všechna nová (zatím nenavštívená) URL, která na stránce
-     * najdeme. Poté, co projdeme celou stránku, budeme z tohoto seznamu
-     * jednotlivá URL brát a zpracovávat.
-     */
-    LinkedList<URIinfo> foundURIs;
-
-    /** pokud debugLevel>1, budeme vypisovat debugovací hlášky na std. error */
-    int debugLevel = 0;
-
-    ParserCallback(HashSet<URI> visitedURIs, LinkedList<URIinfo> foundURIs) {
-        this.foundURIs = foundURIs;
-        this.visitedURIs = visitedURIs;
+    ParserCallback(URI pageURI, boolean collectLinks) {
+        this.pageURI = pageURI;
+        this.collectLinks = collectLinks;
     }
 
-    /**
-     * metoda handleSimpleTag se volá např. u značky <FRAME>
-     */
-    public void handleSimpleTag(HTML.Tag t, MutableAttributeSet a, int pos) {
-        handleStartTag(t, a, pos);
+    /** Parses one HTML document produced by JSoup. */
+    void parse(Document document) {
+        if (document == null) {
+            return;
+        }
+
+        if (collectLinks) {
+            collectLinks(document);
+        }
+
+        // Work on a clone so that extracting text does not alter the parsed
+        // document used for link extraction or debugging.
+        Document visibleDocument = document.clone();
+        visibleDocument.select(NON_TEXT_ELEMENTS).remove();
+        removeElementsHiddenByInlineStyles(visibleDocument);
+
+        String visibleText = visibleDocument.body() == null
+                ? visibleDocument.text()
+                : visibleDocument.body().text();
+        countWords(visibleText);
     }
 
-    public void handleStartTag(HTML.Tag t, MutableAttributeSet a, int pos) {
-        URI uri;
-        String href = null;
-        if (debugLevel > 1)
-            System.err.println("handleStartTag: " + t.toString() + ", pos=" + pos + ", attribs=" + a.toString());
-        if (depth <= maxDepth)
-            if (t == HTML.Tag.A)
-                href = (String) a.getAttribute(HTML.Attribute.HREF);
-            else if (t == HTML.Tag.FRAME)
-                href = (String) a.getAttribute(HTML.Attribute.SRC);
-        if (href != null)
-            try {
-                uri = pageURI.resolve(href);
-                if (!uri.isOpaque() && !visitedURIs.contains(uri)) {
-                    visitedURIs.add(uri);
-                    foundURIs.add(new URIinfo(uri, depth + 1));
-                    if (debugLevel > 0)
-                        System.err.println("Adding URI: " + uri.toString());
+    private void collectLinks(Document document) {
+        Elements linkElements = document.select("a[href], area[href], frame[src], iframe[src]");
+        for (Element element : linkElements) {
+            String attribute = element.hasAttr("href") ? "href" : "src";
+            String absoluteUrl = element.absUrl(attribute);
+
+            // absUrl() uses the document's base URI (including a valid <base> tag).
+            // If it cannot resolve the value, resolve it against the page URI.
+            if (absoluteUrl == null || absoluteUrl.isBlank()) {
+                String rawUrl = element.attr(attribute).trim();
+                try {
+                    absoluteUrl = pageURI.resolve(new URI(rawUrl)).toString();
+                } catch (IllegalArgumentException | URISyntaxException ex) {
+                    continue;
                 }
-            } catch (Exception e) {
-                System.err.println("Nalezeno nekorektní URI: " + href);
-                e.printStackTrace();
             }
 
+            addWebLink(absoluteUrl);
+        }
     }
 
-    /******************************************************************
-     * V metodě handleText bude probíhat veškerá činnost, související se
-     * zjiováním četnosti slov v textovém obsahu HTML stránek.
-     * IMPLEMENTACE TÉTO METODY JE V TÉTO ÚLOZE VAŠÍM ÚKOLEM !!!!
-     * Možný postup:
-     * Ve třídě Parser (klidně v její metodě main) si vytvořte vyhledávací tabulku
-     * =instanci třídy HashMap<String,Integer> nebo TreeMap<String,Integer>.
-     * Do této tabulky si ukládejte dvojice klíč-data, kde
-     * klíčem jsou jednotlivá slova z textového obsahu HTML stránek,
-     * data typu Integer bude dosavadní počet výskytu daného slova v
-     * HTML stránkách.
-     *******************************************************************/
-    public void handleText(char[] data, int pos) {
-        System.out.println("handleText: " + String.valueOf(data) + ", pos=" + pos);
-        /**
-         * ...tady bude vaše implementace...
-         */
+    private void addWebLink(String value) {
+        try {
+            URI uri = new URI(value.trim()).normalize();
+            String scheme = uri.getScheme();
+            if (scheme == null || !(scheme.equalsIgnoreCase("http")
+                    || scheme.equalsIgnoreCase("https"))
+                    || uri.getHost() == null || uri.getHost().isBlank()) {
+                return;
+            }
+
+            // Fragments do not identify different web pages for crawling purposes.
+            String normalizedValue = uri.toString();
+            int fragmentPosition = normalizedValue.indexOf('#');
+            if (fragmentPosition >= 0) {
+                normalizedValue = normalizedValue.substring(0, fragmentPosition);
+            }
+            URI normalizedUri = new URI(normalizedValue).normalize();
+            links.add(normalizedUri);
+        } catch (IllegalArgumentException | URISyntaxException ex) {
+            // Ignore malformed, JavaScript, mailto, data and other non-web URLs.
+        }
+    }
+
+    private static void removeElementsHiddenByInlineStyles(Document document) {
+        Elements styledElements = document.select("[style]");
+        for (Element element : styledElements) {
+            if (HIDDEN_STYLE_PATTERN.matcher(element.attr("style")).find()) {
+                element.remove();
+            }
+        }
+    }
+
+    private void countWords(String text) {
+        Matcher matcher = WORD_PATTERN.matcher(text.toLowerCase(Locale.ROOT));
+        while (matcher.find()) {
+            wordFrequencies.merge(matcher.group(), 1L, Long::sum);
+        }
+    }
+
+    Map<String, Long> getWordFrequencies() {
+        return wordFrequencies;
+    }
+
+    List<URI> getLinks() {
+        return new ArrayList<>(links);
     }
 }
